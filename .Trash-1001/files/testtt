@@ -1,0 +1,29 @@
+My - 
+ScmApplic
+ (ScmLambdaSimple (["value"; "f"; "rest"],
+   ScmIf (ScmVar "value",
+    ScmApplic (ScmApplic (ScmVar "f", []), [ScmVar "value"]),
+    ScmApplic (ScmVar "rest", []))),
+ [ScmVar "a"; ScmLambdaSimple ([], ScmVar "b");
+  ScmLambdaSimple ([],
+   ScmApplic
+    (ScmApplic (ScmVar "x", [ScmConst (ScmNumber (ScmRational (1, 1)))]), 
+    []))])
+
+them -
+  ScmApplic
+   (ScmLambdaSimple (["value"; "f"; "rest"],
+    ScmIf (ScmVar "value",
+     ScmApplic (ScmApplic (ScmVar "f", []), [ScmVar "value"]),
+     ScmApplic (ScmVar "rest", []))),
+    [ScmVar "a"; ScmLambdaSimple ([], ScmVar "b");
+     ScmLambdaSimple ([],
+      ScmIf (ScmVar "x", ScmConst (  (ScmNumber (ScmRational (1, 1)))), ScmConst ScmVoid))])] };
+
+
+
+ScmPair (ScmSymbol "cond",
+ ScmPair (
+     ScmPair
+  (ScmSymbol "a",
+   ScmPair (ScmSymbol "=>", ScmPair (ScmSymbol "b", ScmNil))), ScmPair (ScmPair (ScmSymbol "x", ScmPair (ScmNumber (ScmRational (1, 1)), ScmNil)), ScmNil))));

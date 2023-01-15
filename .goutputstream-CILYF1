@@ -1,0 +1,607 @@
+
+
+#use "semantic-analyser.ml";;
+
+(* This module is here for you convenience only!
+   You are not required to use it.
+   you are allowed to change it. *)
+module type CODE_GEN = sig
+  (* This signature assumes the structure of the constants table is
+     a list of key-value pairs:
+     - The keys are constant values (Sexpr(x) or Void)
+     - The values are pairs of:
+       * the offset from the base const_table address in bytes; and
+       * a string containing the byte representation (or a sequence of nasm macros)
+         of the constant value
+     For example: [(Sexpr(Nil), (1, "T_NIL"))]
+   *)
+  val make_consts_tbl : expr' list -> (sexpr * (int * string)) list
+
+  (* This signature assumes the structure of the fvars table is
+     a list of key-value pairs:
+     - The keys are the fvar names as strings
+     - The values are the offsets from the base fvars_table address in bytes
+     For example: [("boolean?", 0)]
+   *)  
+  val make_fvars_tbl : expr' list -> (string * int) list
+
+  (* If you change the types of the constants and fvars tables, you will have to update
+     this signature to match: The first argument is the constants table type, the second 
+     argument is the fvars table type, and the third is an expr' that has been annotated 
+     by the semantic analyser.
+   *)
+  val generate : (sexpr * (int * string)) list -> (string * int) list -> expr' -> string
+end;;
+
+module Code_Gen : CODE_GEN = struct
+   let lelse = ref 0;;
+   let lexit = ref 0;;
+   let lcont = ref 0;;
+   let lcode = ref 0;;
+   let advance_pointer p = p := !p+1
+   (* lexit := !lexit+1;;   //addvance pointer *)
+  (* let make_consts_tbl asts = raise X_not_yet_implemented;; *)
+  
+  
+    
+  let make_consts_tbl asts = 
+    let rec get_const exp =
+      (match exp with
+      | ScmConst'(x) -> (match x with
+                            | ScmVector(lst) ->  ((List.flatten (List.map (fun e -> (get_const (ScmConst'(x)))) lst)) @ [x])
+                            | ScmPair(car, cdr) -> ((get_const (ScmConst'(car))) @ (get_const (ScmConst'(cdr))) @ [x])
+                            | _ -> [x])
+      | ScmVar'(x) -> []
+      | ScmBox'(x) -> []
+      | ScmBoxGet'(x) -> []
+      | ScmBoxSet'(x,y) -> get_const y
+      | ScmIf'(test, dit, dif) -> (get_const test) @ (get_const dit) @ (get_const dif)
+      | ScmSeq'(lst) -> List.flatten (List.map (fun e -> get_const e) lst)
+      | ScmSet'(x, y) -> get_const y
+      | ScmDef'(x, y) -> get_const y
+      | ScmOr'(lst) -> List.flatten (List.map (fun e -> get_const e) lst)
+      | ScmLambdaSimple'(args, body) -> get_const body
+      | ScmLambdaOpt'(args, first, body) -> get_const body
+      | ScmApplic'(rator, rands) -> (get_const rator) @ (List.flatten (List.map (fun e -> get_const e) rands))
+      | ScmApplicTP'(rator, rands) -> (get_const rator) @ (List.flatten (List.map (fun e -> get_const e) rands))) in
+
+    let rec make_consts_tbl_help expr_lst  = 
+        (match expr_lst with
+            | [] -> []
+            | first::rest -> (get_const first) @ (make_consts_tbl_help rest)) in
+
+    let rec constIsMember sexp ans = (match ans with 
+            | [] -> false
+            | first::rest -> (match (sexpr_eq first sexp) with
+                                  |true -> true
+                                  | _ -> constIsMember sexp rest)) in
+    
+    let rec remove_dup_from_const_lst lst ans=
+        match lst with
+          |[] -> ans
+          |first::rest -> (match first with
+                           |ScmNil -> (remove_dup_from_const_lst rest ans)
+                           |ScmVoid -> (remove_dup_from_const_lst rest ans) 
+                           |ScmBoolean(a) -> (remove_dup_from_const_lst rest ans) 
+                           |_ -> (match (constIsMember first ans) with
+                              |false ->  remove_dup_from_const_lst rest (ans @ [first])
+                              |_ ->  (remove_dup_from_const_lst rest ans))) in
+    
+    let rec checkPosition var lst = 
+        match lst with
+          |[] -> raise X_this_should_not_happen
+          |first::rest -> (match first with 
+                          |(f, (position, _)) -> (match (sexpr_eq f var) with 
+                                                    |true -> position
+                                                    |_ -> checkPosition var rest)
+                          |_ -> raise X_this_should_not_happen) in
+ let rec create_const_table lst position const_tbl = match lst with 
+                  | [] -> const_tbl
+                  | first::rest -> (match first with
+                                      (**advance position with 1 for the tag and then according to sizes in practice 9 add the nessecery space *)
+                                      (**void and nil no value only tag byte *)
+                                      | ScmVoid ->  create_const_table rest (position + 1) (const_tbl @ [(first, (position, "MAKE_VOID"))])
+                                      | ScmNil ->  create_const_table rest (position + 1) (const_tbl @ [(first, (position, "MAKE_NIL"))]) 
+                                      (**bool and char - 1 byte for tag and 1 for val *)
+                                      | ScmBoolean(b) -> let bo = (match b with
+                                                                  |true -> 1
+                                                                  |false -> 0)
+                                                         in
+                                                         create_const_table rest (position + 1 + 1) (const_tbl @ [(first, (position, "MAKE_BOOL("^(string_of_int bo)^")"))])
+                                      (**check how we need to append ch *)
+                                      | ScmChar(ch) -> create_const_table rest (position + 1 + 1) (const_tbl @[(first, (position, "MAKE_LITERAL_CHAR("^ (string_of_int(Char.code ch))^")"))])
+                                      (**strings - we need the 1 byte for tag, 8 for int represantation of str length and then the size str length *)
+                                      | ScmString(str) -> let len = String.length str in
+                                                  create_const_table rest (position + 1 + 8 + len) (const_tbl @ [(first, (position, "MAKE_LITERAL_STRING \""^str^"\""))])
+                                      (**we should check if we need to change symbol to 1 + 8 becuase according to prcatice 9 it get pointer to the string *)
+                                      | ScmSymbol(str) ->  create_const_table rest (position + 1 + 8 + (String.length str)) 
+                                                                  (const_tbl @ [(first, (position, "MAKE_LITERAL_SYMBOL(const + "^(string_of_int(checkPosition (ScmString(str)) const_tbl))^")"))])
+                                      (**num - 1 byte tag and 8 bytes for value *)
+                                      | ScmNumber(num) -> (match num with
+                                                            | ScmRational(x,y) ->  create_const_table rest (position + 1 + 16) (const_tbl @ [(first, (position, "MAKE_LITERAL_RATIONAL("^(string_of_int x)^","^(string_of_int y)^")"))])
+                                                            | ScmReal(x) ->  create_const_table rest (position + 1 + 8) (const_tbl @[(first, (position, "MAKE_LITERAL_FLOAT("^(Float.to_string x)^")"))]))                                                                                        
+                                      (**fix vector so we activate create_const_table with each one of it parts seperatly *)
+                                      (**vector - 1 byte for tag, 8 bytes for size, each slot in vector is pointer so 8 bytes*length *)
+                                      (* | ScmVector(lst) -> let len = List.length lst in
+                                                          let str_lst = (List.fold_left (fun a sexp -> a^",const_tbl + "^(string_of_int(checkPosition sexp const_tbl))) "" lst) in
+                                                          let make_lit_vec size = match size with
+                                                                  |0 ->  "MAKE_LITERAL_VECTOR(0)"
+                                                                  |_ ->  "MAKE_LITERAL_VECTOR("^len^" "^str_lst^")"
+                                                          create_const_table rest (position + 1 + 8 + 8*len) (const_tbl @ [(first, (position, make_lit_vec))]) *)
+                                      (**fix pair so we activate create_const_table with each one of it parts seperatly (car and cdr) *)
+                                      (**vector - 1 byte for tag, 8 bytes for car pointer, 8 bytes for cdr pointer *)
+                                      | ScmPair(car,cdr) ->  create_const_table rest (position + 17) (const_tbl @ 
+                                                                                                      [(first, (position, "MAKE_LITERAL_PAIR(const_tbl + "^(string_of_int(checkPosition car const_tbl))^
+                                                                                                  ",const_tbl + "^(string_of_int(checkPosition cdr const_tbl))^")"))]) 
+
+                                      | _ -> raise X_this_should_not_happen) in
+    
+    let const_table = make_consts_tbl_help asts in
+    let const_table = remove_dup_from_const_lst const_table [] in
+    let const_table = [ScmVoid; ScmNil; ScmBoolean(false); ScmBoolean(true)] @ const_table in
+    create_const_table const_table 0 []
+
+  let make_fvars_tbl asts = 
+     let rec get_fvar exp =
+      (match exp with
+      | ScmConst'(x) -> []
+      | ScmVar'(x) -> (match x with 
+                      |VarFree(v) -> [v]
+                      |_-> [])
+      | ScmBox'(x) -> []
+      | ScmBoxGet'(x) -> []
+      | ScmBoxSet'(x,y) -> get_fvar y
+      | ScmIf'(test, dit, dif) -> (get_fvar test) @ (get_fvar dit) @ (get_fvar dif)
+      | ScmSeq'(lst) -> List.flatten (List.map (fun e -> get_fvar e) lst)
+      | ScmSet'(x, y) -> get_fvar y
+      | ScmDef'(x, y) -> get_fvar y
+      | ScmOr'(lst) -> List.flatten (List.map (fun e -> get_fvar e) lst)
+      | ScmLambdaSimple'(args, body) -> get_fvar body
+      | ScmLambdaOpt'(args, first, body) -> get_fvar body
+      | ScmApplic'(rator, rands) -> (get_fvar rator) @ (List.flatten (List.map (fun e -> get_fvar e) rands))
+      | ScmApplicTP'(rator, rands) -> (get_fvar rator) @ (List.flatten (List.map (fun e -> get_fvar e) rands))) in
+
+    (**shuold we flatten this list? because getfvar returns a *)
+    let rec make_fvars_tbl_help expr_lst  = (List.flatten (List.map (fun e -> get_fvar e) expr_lst)) in
+
+        (* (match expr_lst with
+            | [] -> []
+            | first::rest -> (get_fvar first) @ (make_fvars_tbl_help rest)) in *)
+
+    let rec varIsMember name ans = (match ans with 
+            | [] -> false
+            | first::rest -> (match (String.compare first name) with
+                                  |0 -> true
+                                  |_ -> varIsMember name rest)) in
+    
+    let rec remove_dup_from_fvars_lst lst ans=
+        match lst with
+          |[] -> ans
+          |first::rest -> (match (varIsMember first ans) with
+
+                              |false ->  remove_dup_from_fvars_lst rest (ans @ [first])
+                              |_ ->  (remove_dup_from_fvars_lst rest ans)) in
+    
+    (**we should add here all the fvar methods that are not in code and then append it to the create const table while index will be the last index 
+     we probable don't need to do it because the expr' list that we get is built from stdlib.scm appended with the infile.scm*)
+    let rec create_fvars_table lst index = 
+        (match lst with
+          | [] -> []
+          | first::rest -> [(first, index)] @ (create_fvars_table rest (index + 1))) in
+                   
+    let fvars_table = make_fvars_tbl_help asts in
+    let fvars_table = remove_dup_from_fvars_lst fvars_table [] in
+    let primitive_labels =  [
+              (* Type queries  *)
+              "boolean?"; "flonum?"; "rational?";
+              "pair?"; "null?"; "char?"; "string?";
+              "procedure?"; "symbol?";
+              (* String procedures *)
+              "string-length"; "string-ref"; "string-set!";
+              "make-string"; "symbol->string";
+              (* Type conversions *)
+              "char->integer"; "integer->char"; "exact->inexact";
+              (* Identity test *)
+              "eq?";
+              (* Arithmetic ops *)
+              "+"; "*"; "/"; "="; "<";
+              (* Additional rational numebr ops *)
+              "numerator"; "denominator"; "gcd";
+              (* you can add yours here *)
+            ] in
+    let fvar_tbl = primitive_labels @ fvars_table in
+    create_fvars_table fvar_tbl 0
+    (* create_fvars_table primitive_labels 0 *)
+
+    
+  let generate consts fvars e = 
+      let rec gen exp env_depth =
+      (match exp with
+          | ScmConst'(x) -> "mov rax, const_tbl +"^string_of_int(constOffsetInConsts x consts)^ "; insert const from const table to rax"
+          | ScmVar'(x) -> (match x with
+                          |VarParam(_,minor) -> "mov rax, qword [rbp + " ^string_of_int(8 * ( 4 + minor))^ "]"
+                          |VarBound(_,major, minor) -> "mov rax, qword [rbp + 8*2]
+                                                              \n mov rax, qword[rax +" ^string_of_int(8 * major)^ "]
+                                                              \n mov rax, qword[rax +" ^string_of_int(8 * minor)^ "]"
+                          |VarFree(v) -> "mov rax, qword [fvar_tbl + " ^string_of_int(8 * (varIndexInFvar v fvars))^ "]"
+                          |_ -> raise X_this_should_not_happen)
+          | ScmBox'(x) -> generate_box x env_depth
+          | ScmBoxGet'(x) -> generate_box_get x env_depth
+          | ScmBoxSet'(x,y) -> generate_box_set x y env_depth
+          | ScmIf'(test, dit, dif) -> generate_if test dit dif env_depth
+          | ScmSeq'(lst) -> (List.fold_left (fun a b -> a^(gen b env_depth)^"\n") "" lst)
+          | ScmSet'(x, y) -> (match x with
+                          |VarParam(_,minor) -> (gen y env_depth)^
+                                                              "\n mov qword [rbp + " ^string_of_int(8 * ( 4 + minor))^ "], rax
+                                                              \n mov rax SOB_VOID_ADDRESS"
+                          |VarBound(_,major, minor) ->(gen y env_depth)^
+                                                            "\n mov rbx, qword [rbp + 8*2]
+                                                              \n mov rbx, qword [rbx +" ^string_of_int(8 * major)^"]
+                                                              \n mov qword[rbx +" ^string_of_int(8 * minor)^"], rax
+                                                              \n mov rax SOB_VOID_ADDRESS"
+                          |VarFree(v) -> (gen y env_depth)^
+                                                "\n mov qword [fvar_tbl + " ^string_of_int(8*(varIndexInFvar v fvars))^ "], rax
+                                                  \n mov rax, SOB_VOID_ADDRESS"
+                          |_ -> raise X_this_should_not_happen)
+          | ScmDef'(x, y) -> (match x with
+                          |VarFree(v) -> generate_def v y env_depth
+                          |_ -> raise X_this_should_not_happen)
+          | ScmOr'(lst) ->  let ext = (advance_pointer lexit) in
+                            let str = generate_or lst "" env_depth in                      
+                            str                       
+          | ScmLambdaSimple'(args, body) -> let code = (advance_pointer lcode) in
+                                            let cont =  (advance_pointer lcont) in 
+                                            (generate_lambda_simple args body env_depth)
+          | ScmLambdaOpt'(args, first, body) -> let code = (advance_pointer lcode) in
+                                                let cont =  (advance_pointer lcont) in 
+                                              (generate_lambda_opt args first body env_depth)
+          | ScmApplic'(rator, rands) -> let ext = (advance_pointer lexit) in
+                                        (generate_applic rator rands env_depth)
+          (* | ScmApplicTP'(rator, rands) -> let ext = (advance_pointer lexit) in 
+                                          (generate_applic rator rands env_depth)) *)
+          |_-> (raise X_this_should_not_happen))
+      
+      and generate_if test dit dif env_depth = 
+            let else_label = "Lelse"^(string_of_int (!lelse)) in
+            let add_1 = (advance_pointer lelse) in
+            let exit_label = "Lexit"^(string_of_int (!lexit)) in
+            let add_1 = (advance_pointer lexit) in
+            let gen_test = gen test env_depth in
+            let gen_dit = gen dit env_depth in
+            let gen_dif = gen dif env_depth in
+            gen_test ^
+            "\n cmp rax, SOB_FALSE_ADDRESS
+             \n je "^else_label^"\n"^
+             gen_dit^
+             "\n jmp "^exit_label^"\n"^
+             else_label^":\n"^
+             gen_dif^"\n"^
+             exit_label^":"
+
+
+      and generate_applic rator rands env_depth =
+            let gen_rands = (List.map (fun e -> gen e env_depth) rands) in
+            let rands_num = List.length gen_rands in
+            let gen_rands = (List.fold_left (^) "" (List.rev (List.map (fun e -> e ^ "\npush rax\n") gen_rands))) in
+            let gen_rator = gen rator env_depth in
+            let label_exit = "Exit_applic_"^ (string_of_int !lexit) in
+            ";generate applic\n"^
+            gen_rands ^ "
+            push " ^ (string_of_int rands_num) ^ "  ; number of args\n" ^
+            gen_rator ^ "
+            mov rsi, rax  ; move the rator to rsi
+            mov bl, byte [rsi]
+            cmp bl, T_CLOSURE
+            jne "^ label_exit ^ "
+            CLOSURE_ENV rsi, rax
+            push rsi ;push env
+            CLOSURE_CODE rsi, rax
+            call rsi ;call code
+            add rsp, 8*1 ;pop Env
+            pop rbx ;pop arg count       
+            shl rbx, 3 ;rbx=rbx*8
+            add rsp,rbx ;pop args\n"^
+            label_exit^":"
+
+    and generate_def var value env_depth = 
+          let gen_value = gen value env_depth in
+          let var_ind = varIndexInFvar var fvars in
+          ";;generate define
+          " ^ gen_value ^ "\n" ^
+          "mov [fvar_tbl+" ^ (string_of_int var_ind) ^ "*WORD_SIZE], rax ; insert var to free var table\n" ^
+          "mov rax, SOB_VOID_ADDRESS ; define return void"
+
+
+
+
+  and generate_lambda_simple args body env_depth =
+        let code_label = "Lcode"^(string_of_int (!lcode)) in
+        let add_1 = (advance_pointer lcode) in
+        let cont_label = "Lcont"^(string_of_int (!lcont)) in
+        let add_1 = (advance_pointer lcont) in
+        let arg_len = (List.length args) in
+        (**crate vector to represent env, this will be a pointers array to prevoius env *)
+         "\n MALLOC rax, "^ (string_of_int (8* (env_depth+1)))^
+        (**push and pop should be allright because we work with rbp and not rsp
+           so pointer values should be ok *)
+        "\n push rbx
+         \n push rdx
+         \n mov qword rbx, [rbp + 8*2]\n" ^ 
+        (makeEnv 0 1 env_depth "")^ 
+        "\n push rax
+         \n MALLOC rax, "^(string_of_int(8 * arg_len))^"; num of params"^
+        (makeParams 0 (List.length args) "")^
+        "\n mov rdx, rax
+         \n pop rax
+         \n mov qword [rax], rdx
+         \n pop rdx 
+         \n pop rbx
+         \n push r8
+         \n mov r8, [rax]
+         \n MAKE_CLOSURE(rax ,r8, "^code_label^")"^
+        "\n pop r8
+         \n jmp "^cont_label^
+        "\n "^code_label^":"^
+            "\n push rbp
+             \n mov rbp, rsp
+             \n "^(gen body (env_depth+1))^
+            "\n leave
+             \n ret
+         \n "^cont_label^":"
+
+  and generate_lambda_opt args first body env_depth =
+        let arg_len = (List.length args) in
+        let cont_label = "Lcont"^(string_of_int (!lcont)) in
+        let add_1 = (advance_pointer lcont) in
+        let code_label = "Lcode"^(string_of_int (!lcode)) in
+        let add_1 = (advance_pointer lexit) in
+        let gen_env = (makeEnv 0 1 env_depth "") in
+        let gen_params = (makeParamsOpt 0 arg_len "") in
+        
+        ";            generate_lambda_opt
+        \n MALLOC rax, "^ (string_of_int (8 * (env_depth+1)))^
+        (**push and pop should be allright because we work with rbp and not rsp
+           so pointer values should be ok *)
+        "\n push rbx
+         \n push rdx
+         \n mov qword rbx, [rbp + 8*2] ;pointer to env"^ 
+         "\n;           generate env\n"^
+        gen_env^ 
+        "\n push rax ;push env to stack 
+         \n MALLOC rax, "^(string_of_int(8*(arg_len+1)))^"; num of params"^
+        "\n;           generate params\n"^
+        gen_params^ 
+        "\n mov rdx, rax ; save params array pointer in rdx
+         \n pop rax ;restore pointer for env allocate
+         \n mov qword r8, rdx ;put the pointer from rdx in the 0 index in env array
+         \n pop rdx; restore rdx 
+         \n pop rbx; restore rbx
+         \n MAKE_CLOSURE (rax ,r8, "^code_label^")"^
+        "\n jmp "^cont_label^
+        "\n "^code_label^":
+             \n push rbp
+             \n mov rbp, rsp
+             \n "^(gen body (env_depth+1))^
+            "\n leave
+             \n ret
+         \n "^cont_label^":"
+
+
+  and makeEnv i j env_depth str =
+      if( i < env_depth) then
+        makeEnv (i+1) (j+1) env_depth (str ^"\n mov qword rdx, [rbx +" ^string_of_int (i*8)^"]
+                                       \n mov qword [rax+ "^string_of_int(j*8)^"], rdx" )
+                    else
+                    str
+  and makeParams i len str =
+      if i < len then
+              (makeParams (i+1) len (str ^ 
+                "\n mov rbx, [rbp + 8*4 + ("^(string_of_int (i*8))^")] 
+                \n mov [rax + " ^ (string_of_int (i*8)) ^ "], rbx\n" 
+              ))
+            else str 
+  and makeParamsOpt i arg_len str =
+      if i < arg_len then
+              (makeParamsOpt (i+1) arg_len (str ^ 
+                "\n mov rbx, [rbp + 8*4 + ("^(string_of_int (i*8))^")] 
+                 \n mov [rax + " ^ (string_of_int (i*8)) ^ "], rbx\n" 
+              ))
+            else
+                str^
+
+                "LABEL_TEST_TEST:
+                 \n push rdx
+                 \n push rbx
+                 \n push rcx
+                 \n push rax"^
+                "\n OPT_PARAMS "^(string_of_int(arg_len))^", SOB_NIL_ADDRESS"^
+                "\n pop rax
+                 \n mov [rax + " ^ (string_of_int (arg_len*8)) ^ "], rdx
+                 \n pop rcx
+                 \n pop rbx
+                 \n pop rdx\n"
+
+  and generate_or lst ans env_depth = 
+        let exit_label = "Lexit"^(string_of_int (!lexit)) in
+        (generate_or_help lst ans env_depth exit_label) 
+
+  and generate_or_help lst ans env_depth exit_label = (match lst with
+                      |[] -> ans^"\n"^exit_label^":"
+                      |[first] -> generate_or_help [] (ans^(gen first env_depth)^"\n") env_depth exit_label
+                      |first::rest -> generate_or_help rest (ans^(gen first env_depth)^"\ncmp rax, SOB_FALSE_ADDRESS
+                                                                \n jne "^exit_label^"\n") env_depth exit_label)
+        
+                                  
+
+  and generate_box var env_depth = 
+        let gen_var = gen (ScmVar'(var)) env_depth in
+        gen_var ^
+        "MALLOC rbx, 8
+        mov qword[rbx], rax
+        mov rax, rbx
+        "
+
+
+  and generate_box_get var env_depth = 
+        let gen_var = gen (ScmVar'(var))  env_depth in
+        gen_var ^ "
+        mov rax, qword [rax]
+        "
+
+  and generate_box_set var vl env_depth = 
+        let gen_var = gen (ScmVar'(var)) env_depth in
+        let gen_val = gen vl env_depth in
+        gen_val ^ 
+        "push rax" ^ 
+        gen_var ^ 
+        "pop qword [rax]    
+        mov rax, SOB_VOID_ADDRESS"      
+        (* todo - change the name above *)
+    
+        
+  and constOffsetInConsts sexp const_tbl = 
+    (match const_tbl with 
+        |[] -> raise X_this_should_not_happen
+        |first::rest -> (match first with
+              |(sexpr, (offset, asm_str)) -> (match (sexpr_eq sexpr sexp) with
+                          | true -> offset
+                          | _ -> constOffsetInConsts sexp rest)
+              |_-> raise X_this_should_not_happen)) 
+
+
+  and varIndexInFvar var fVar_table = 
+    (match fVar_table with 
+        |[] -> raise X_this_should_not_happen
+        |first::rest -> (match first with
+              |(name,pointer) -> (match (String.compare name var) with
+                          | 0 -> pointer
+                          | _ -> varIndexInFvar var rest)
+              |_-> raise X_this_should_not_happen)) in
+  
+  gen e 0
+
+      
+end;;
+
+
+
+
+
+
+
+
+(*asm explain :
+imutable sizes we will use:
+%define TYPE_SIZE 1
+%define WORD_SIZE 8
+in run time we crate a 4GB stack that we will use without option to go back
+we will use malloc_pointer as stack_pointer.
+%macro MALLOC 2 // malloc get 2 args, %1 register to work with (rax) and %2 size to advance the malloc_pointer(stack pointer)
+add qword [malloc_pointer], %2 //add size to malloc_pointer
+mov %1, qword [malloc_pointer]  //mov size of malloc pointer to register
+sub %1, %2  //reduce the size we added to malloc_pointer from register. so now we can work with the register to add value from last
+            //malloc_pointer place to the new malloc pointer_place
+%endmacro
+to insert something to section.data we should use db dq dw asm functions.
+those actions will create a constant before run time. so Make_Literal is a way to create a constant in section.data
+%macro MAKE_LITERAL 2 ; Make a literal of type %1 
+; followed by the definition %2
+db %1 //define the type of constant
+%2    //define the value
+%endmacro
+create a macro to define a constant int.
+%define MAKE_LITERAL_INT(val) MAKE_LITERAL T_INTEGER, dq val
+constant table is a pointer to the constant table in section data. so every make literal action after this sign
+will define new constant in the table according to the size we need.
+constants_table:
+const1:
+MAKE_LITERAL_INT(1) //for example const1 is the first time we use db wich meanse thatwe run  db T_INTEGER
+                                                                                             dq val
+                    //and this the first 9 bytes of constant table wich means that from constant table offset to the end of constant 1
+                    //we have 9 bytes. so const1 is 0 bytes from constant table offset. and const2 is 9 bytes from offset
+const2:
+MAKE_LITERAL_CHAR('a')
+const_nil:
+MAKE_NIL
+what happens in run time:
+when we want to make a var in run time it wont be const so we want to put it on the heap in out case it will be the
+new stack we built.
+%macro MAKE_CHAR_VALUE 2 ; Creates a short SOB with the
+; value %2
+; Returns the result in register %1
+MALLOC %1, 1+TYPE_SIZE   //%1 will be rax register. and we advance the malloc_pointer with 1 according to a size of char
+                         // and TYPE_SIZE is always size of 1 byte to.
+mov byte [%1], T_CHAR    // enter byte to the loaction in stack rax save(%1)
+mov byte [%1+TYPE_SIZE], %2 //enter the value to the loaction in stack rax save +1 wich means we add 
+%endmacro
+               [malloc_pointer]  
+stack before -> |              |             |              |             |             |
+                    [rax]     [rax+TYPE_SIZE][malloc_pointer]
+stack after ->  |      6      |     'C'     |              |             |             |
+ 
+ %macro MAKE_STRING 3 ; Create a string of length %2
+      ; from char %3.
+      ; Stores result in register %1
+      mov %1, %2+WORD_BYTES+TYPE_SIZE //mov to rax the size we need in stack inclding %2 size of int and WORD_BYTES to tell us what 
+                                      //is the string length and TYPE_SIZE for TSTRING.
+      MALLOC %1, %1                   //use malloc %1 as rax register and because rax also contain the size we need in stack we pass
+                                      //it as %2 
+      //end of malloc rax(%1) no longer contains the size we need but it's ok beacuse now we got malloc_pointer update to
+      //malloc_pointer+%2+WORD_BYTES+TYPE_SIZE and rax is the old malloc_pointer place.
+      
+      mov byte [%1], T_STRING     //T_STRING -> [rax]    
+      mov qword [%1+TYPE_SIZE], %2 //string length(%2) -> [rax+1]
+      push rcx // we going to use rcx as decending counter for string length. so we need to back it up
+      add %1, WORD_BYTES+TYPE_SIZE //advance rax pointer in WORD_BYTES+TYPE_SIZE wich means that if rax = 0
+                                   //now rax = 9 so after we enter the type and string length we can start insert the string 1 char each time.
+      mov rcx, %2  //mov the size of string to rcx. 
+      cmp rcx, 0   //compare the string counter to zero
+%%str_loop:       
+      jz %%str_loop_end //if zero we done jomp to loop end
+      dec rcx //else decend rcx by 1
+      mov byte [%1+rcx], %3 //not exactly sure why this is working with %3
+jmp %%str_loop
+%%str_loop_end:
+      pop rcx //restore rcx
+      sub %1, WORD_BYTES+TYPE_SIZE //restore rax to the old malloc_pointer so when we finsih we will return the loaction of the var in stack
+%endmacro
+for literal we just use the pointers of %%str and %%end_str and we will get the string length.
+macro MAKE_LITERAL_STRING 1
+db T_STRING
+dq (%%end_str - %%str)
+%%str:
+db %1
+%%end_str:
+%endmacro
+%% labels will make sure we use local labels for ceach make_literal_string.
+Getters
+Now we look at data getters for for some of the above types:
+we pass r as the loaction where the var is in the stack. so the type is just 1 byte and it will be the first byte
+for each var. the data always comes after the TYPE_SIZE so we use DATA to get the data.
+%define TYPE(r) byte [r] 
+%define DATA(r) [r + TYPE_SIZE]
+so as we can see each getter ger his offset in stack(r) and then to get the data with DATA(r) Macro that get the data
+accoridng to the type size-> int and float are 8 Bytes si we use qword. char and bool are 1 Byte so we ure byte.
+                             for string we take the lenght and the use it to reutrn the data
+%define INT_DATA(r) qword DATA(r)
+%define FLOAT_DATA(r) qword DATA(r)
+%define CHAR_DATA(r) byte DATA(r)
+%define BOOL_DATA(r) byte DATA(r)
+%define STR_LEN(r) qword DATA(r)
+%define STR_DATA_PTR(r) r + WORD_BYTES + TYPE_SIZE
+//string ref return the char at index i
+%define STRING_REF(r, i) byte [r+WORD_BYTES + TYPE_SIZE + i]
+Symbols are tagged with the T_SYMBOL type and their data is a pointer to their name (a string
+SOB)
+Vectors are tagged with the T_VECTOR type. The data in their first qword after the tag is the
+number of elements in the vector. The following <length> qwords in memory after the length are
+pointers to the vector’s elements.
+It means vector is an array of pointer.
+get tag, length of vector and then each one of his cells is a pointer(int value)
+Pairs are tagged with the T_PAIR type. The data of the first qword after the tag is the car pointer
+and the next qword in memory is the pointer to the cdr.
+Pairs get tag and 2 pointers.
+Closures are tagged with the T_CLOSURE type. They hold the environment pointer in their first
+qword after the tag. The second qword is a pointer to the body of the code in the text section.
+So Closures get tag, pointer for env and pointer for code
+*)
